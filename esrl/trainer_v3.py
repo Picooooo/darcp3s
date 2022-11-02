@@ -1,0 +1,287 @@
+from copy import deepcopy
+import time
+import tqdm
+import numpy as np
+from collections import defaultdict
+from typing import Dict, Union, Callable, Optional
+import pandas as pd
+from esrl.util import *
+import torch
+
+from tianshou.data import Collector
+from esrl.policy.base import BasePolicy
+from tianshou.trainer import test_episode, gather_info
+from tianshou.utils import tqdm_config, MovAvg, BaseLogger, LazyLogger
+from torch.distributions.kl import kl_divergence
+from torch.distributions import Normal
+
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+def kl(mean1, std1, mean2, std2):
+        distribution1   = Normal(mean1, std1)
+        distribution2   = Normal(mean2, std2)
+
+        return kl_divergence(distribution1, distribution2).float().to(device)
+
+
+
+def trainer_v3(
+    policy: BasePolicy,
+    train_collector: Collector,
+    test_collector: Collector,
+    max_epoch: int,
+    step_per_epoch: int,
+    step_per_collect: int,
+    episode_per_test: int,
+    batch_size: int,
+    update_per_step: Union[int, float] = 1,
+    train_fn: Optional[Callable[[int, int], None]] = None,
+    test_fn: Optional[Callable[[int, Optional[int]], None]] = None,
+    stop_fn: Optional[Callable[[float], bool]] = None,
+    save_fn: Optional[Callable[[BasePolicy], None]] = None,
+    save_checkpoint_fn: Optional[Callable[[int, int, int], None]] = None,
+    resume_from_log: bool = False,
+    reward_metric: Optional[Callable[[np.ndarray], np.ndarray]] = None,
+    logger: BaseLogger = LazyLogger(),
+    verbose: bool = True,
+    test_in_train: bool = True,
+    **kwargs
+) -> Dict[str, Union[float, str]]:
+    """A wrapper for off-policy trainer procedure.
+
+    The "step" in trainer means an environment step (a.k.a. transition).
+
+    :param policy: an instance of the :class:`~tianshou.policy.BasePolicy` class.
+    :param Collector train_collector: the collector used for training.
+    :param Collector test_collector: the collector used for testing.
+    :param int max_epoch: the maximum number of epochs for training. The training
+        process might be finished before reaching ``max_epoch`` if ``stop_fn`` is set.
+    :param int step_per_epoch: the number of transitions collected per epoch.
+    :param int step_per_collect: the number of transitions the collector would collect
+        before the network update, i.e., trainer will collect "step_per_collect"
+        transitions and do some policy network update repeatly in each epoch.
+    :param episode_per_test: the number of episodes for one policy evaluation.
+    :param int batch_size: the batch size of sample data, which is going to feed in the
+        policy network.
+    :param int/float update_per_step: the number of times the policy network would be
+        updated per transition after (step_per_collect) transitions are collected,
+        e.g., if update_per_step set to 0.3, and step_per_collect is 256, policy will
+        be updated round(256 * 0.3 = 76.8) = 77 times after 256 transitions are
+        collected by the collector. Default to 1.
+    :param function train_fn: a hook called at the beginning of training in each epoch.
+        It can be used to perform custom additional operations, with the signature ``f(
+        num_epoch: int, step_idx: int) -> None``.
+    :param function test_fn: a hook called at the beginning of testing in each epoch.
+        It can be used to perform custom additional operations, with the signature ``f(
+        num_epoch: int, step_idx: int) -> None``.
+    :param function save_fn: a hook called when the undiscounted average mean reward in
+        evaluation phase gets better, with the signature ``f(policy: BasePolicy) ->
+        None``.
+    :param function save_checkpoint_fn: a function to save training process, with the
+        signature ``f(epoch: int, env_step: int, gradient_step: int) -> None``; you can
+        save whatever you want.
+    :param bool resume_from_log: resume env_step/gradient_step and other metadata from
+        existing tensorboard log. Default to False.
+    :param function stop_fn: a function with signature ``f(mean_rewards: float) ->
+        bool``, receives the average undiscounted returns of the testing result,
+        returns a boolean which indicates whether reaching the goal.
+    :param function reward_metric: a function with signature ``f(rewards: np.ndarray
+        with shape (num_episode, agent_num)) -> np.ndarray with shape (num_episode,)``,
+        used in multi-agent RL. We need to return a single scalar for each episode's
+        result to monitor training in the multi-agent RL setting. This function
+        specifies what is the desired metric, e.g., the reward of agent 1 or the
+        average reward over all agents.
+    :param BaseLogger logger: A logger that logs statistics during
+        training/testing/updating. Default to a logger that doesn't log anything.
+    :param bool verbose: whether to print the information. Default to True.
+    :param bool test_in_train: whether to test in the training phase. Default to True.
+
+    :return: See :func:`~tianshou.trainer.gather_info`.
+    """
+    start_epoch, env_step, gradient_step = 0, 0, 0
+    if resume_from_log:
+        start_epoch, env_step, gradient_step = logger.restore_data()
+    last_rew, last_len = 0.0, 0
+    stat: Dict[str, MovAvg] = defaultdict(MovAvg)
+    start_time = time.time()
+    train_collector.reset_stat()
+    test_collector.reset_stat()
+    test_in_train = test_in_train and train_collector.policy == policy
+    test_result = test_episode(policy, test_collector, test_fn, start_epoch,
+                               episode_per_test, logger, env_step, reward_metric)
+    best_epoch = start_epoch
+    best_reward, best_reward_std = test_result["rew"], test_result["rew_std"]
+
+    best_actor = deepcopy(policy)
+
+    es = kwargs['es']
+    pop_size = kwargs['pop_size']
+    max_step = kwargs['max_step']
+    log_path = kwargs['log_path']
+    actor_lr = kwargs['actor_lr']
+    episode_per_epoch = kwargs['episode_per_epoch']
+    df = pd.DataFrame(columns=["total_steps",
+                               "mu_score", "mu_score_std",])
+    action_shape = kwargs['action_shape']
+    mean_fitness = -9999
+
+    increase_update_yet = False
+    best_actor_index = 0
+    best_actor_params = None
+    total_update_step = 5000
+    beta = 0.5
+    update_beta_step = 0
+    for epoch in range(1 + start_epoch, 1 + max_epoch):
+        sample_step = 0
+        if env_step >= max_step:
+            break
+        if env_step >= 0.1 * max_step and not increase_update_yet:
+            update_per_step += 1
+            increase_update_yet = True
+        if best_actor_params is not None:
+            # t doi actor->actor1 xem sao, coi nhu trong 1 cá thể thì actor1 là gốc, còn actor2 như actor phụ thui
+            #set_params(best_actor.actor, best_actor_params)
+            set_params(best_actor.actor1, best_actor_params)
+
+        params = es.ask(pop_size//2)
+        es_fitness = [0] * (pop_size//2)
+        rl_fitness = [0] * (pop_size//2)
+        for pop_ind in range(pop_size//2):
+            #set_params(policy.actor, params[pop_ind])
+            set_params(policy.actor1, params[pop_ind])
+            policy.train()
+            result = train_collector.collect(n_episode=1)
+            es_fitness[pop_ind] = int(result['rews'][0])
+            env_step += int(result['n/st'])
+            sample_step += int(result['n/st'])
+        prYellow(f'\nEnv Step: {env_step}')
+        prGreen(f'ES fitness: {es_fitness}')
+
+        rl_params = np.zeros_like(params)
+        for pop_ind in range(pop_size//2):
+            #set_params(policy.actor1, params[pop_ind])
+            #policy.actor_optim = torch.optim.Adam(policy.actor.parameters(), actor_lr)
+            set_params(policy.actor1, params[pop_ind])
+            policy.actor1_optim = torch.optim.Adam(policy.actor1.parameters(), actor_lr)
+            policy.train()
+            actor_step = 0
+            actor_score = 0
+
+            with tqdm.tqdm(
+                total=episode_per_epoch, desc=f"Actor #{pop_ind}", **tqdm_config
+            ) as t:
+                while t.n < t.total:
+                    result = {}
+                    while actor_step <= total_update_step:
+                        result = train_collector.collect(n_step=step_per_collect)
+                        env_step += int(result["n/st"])
+                        actor_step += int(result["n/st"])
+                        logger.log_train_data(result, env_step)
+                        data = {
+                            "env_step": str(env_step),
+                            "n/ep": str(int(t.n)),
+                            "n/st": str(actor_step),
+                        }
+                        for i in range(update_per_step):
+                            gradient_step += 1
+                            losses = policy.update(best_actor, action_shape, batch_size, train_collector.buffer, beta)
+                            for k in losses.keys():
+                                stat[k].add(losses[k])
+                                losses[k] = stat[k].get()
+                                data[k] = f"{losses[k]:.3f}"
+                            logger.log_update_data(losses, gradient_step)
+                            t.set_postfix(**data)
+
+                    t.update(1)
+
+                if t.n <= t.total:
+                    t.update()
+
+            actor_test_result = train_collector.collect(n_episode=1)
+            env_step += actor_test_result['n/st']
+            sample_step += actor_test_result['n/st']
+            actor_score = int(actor_test_result['rews'][0])
+            prLightPurple(f'\tactor_test_result: {actor_test_result}')
+
+            #rl_params[pop_ind] = get_params(policy.actor)
+            rl_params[pop_ind] = get_params(policy.actor1)
+            rl_fitness[pop_ind] = actor_score
+        
+        total_update_step = sample_step//2
+        
+        prRed(f'RL fitness: {rl_fitness}')
+        es.tell(np.concatenate((rl_params,params)), rl_fitness+es_fitness)
+
+        total_params = np.concatenate((rl_params, params))
+        fitness = rl_fitness + es_fitness
+
+        best_actor_index = np.argmax(fitness)
+        best_actor_params = total_params[best_actor_index]
+
+        #set_params(policy.actor, es.mu)
+        set_params(policy.actor1, es.mu)
+        test_result = test_episode(policy, test_collector, test_fn, epoch,
+                                   episode_per_test, logger, env_step, reward_metric)
+
+        #update beta
+        # if update_beta_step+10000 < env_step:
+        #     old_params = params
+        #     new_params = rl_params
+        #     new_policy = deepcopy(policy)
+        #     old_policy = deepcopy(policy)
+        #     D_best = []
+        #     D_change = []
+        #     batch, indices = train_collector.buffer.sample(batch_size)
+        #     set_params(best_actor.actor, best_actor_params)
+        #     for pop_ind in range(pop_size//2):
+        #         if pop_ind != best_actor_index:
+        #             #print(best_actor_index)
+        #             set_params(new_policy.actor, new_params[pop_ind])
+        #             set_params(old_policy.actor, old_params[pop_ind])
+        #             batch = new_policy.process_fn(batch, train_collector.buffer, indices)
+        #             new_dist = new_policy(batch).act
+        #             batch = best_actor.process_fn(batch, train_collector.buffer, indices)
+        #             best_dist = best_actor(batch).act
+        #             batch = old_policy.process_fn(batch, train_collector.buffer, indices)
+        #             old_dist = old_policy(batch).act
+        #             std = torch.ones([1, action_shape[0]]).float().to(device)
+        #             best_KL = kl(new_dist, std, best_dist, std).mean()
+        #             old_KL = kl(new_dist, std, old_dist, std).mean()
+
+        #             D_best.append(best_KL)
+        #             D_change.append(old_KL)
+        #             #print(D_best)
+        #             #print(D_change)
+        #     print(torch.mean(torch.stack(D_best)))
+        #     print(torch.mean(torch.stack(D_change)))
+        #     print(max(0.5 * torch.mean(torch.stack(D_change)), 0.07) * 1.5)
+        #     print(max(0.5 * torch.mean(torch.stack(D_change)), 0.07) / 1.5)
+        #     if torch.mean(torch.stack(D_best)) > max(0.5 * torch.mean(torch.stack(D_change)), 0.07) * 1.5:
+        #         if beta < 1000:
+        #             beta = beta * 2
+        #     if torch.mean(torch.stack(D_best)) < max(0.5 * torch.mean(torch.stack(D_change)), 0.07) / 1.5:
+        #         if beta > 1/1000:
+        #             beta = beta / 2
+        #     update_beta_step = env_step
+        #     print(beta)
+        
+        rew, rew_std = test_result["rew"], test_result["rew_std"]
+        df.to_pickle(os.path.join(log_path, 'log.pkl'))
+        res = {"total_steps": env_step,
+               "mu_score": rew,
+               "mu_score_std": rew_std,
+               }
+        df = df.append(res, ignore_index=True)
+
+        if best_epoch < 0 or best_reward < rew:
+            best_epoch, best_reward, best_reward_std = epoch, rew, rew_std
+            if save_fn:
+                save_fn(policy)
+        logger.save_data(epoch, env_step, gradient_step, save_checkpoint_fn)
+        if verbose:
+            print(f"Epoch #{epoch}: test_reward: {rew:.6f} ± {rew_std:.6f}, best_rew"
+                  f"ard: {best_reward:.6f} ± {best_reward_std:.6f} in #{best_epoch}")
+        if stop_fn and stop_fn(best_reward):
+            break
+    return gather_info(start_time, train_collector, test_collector,
+                       best_reward, best_reward_std)
