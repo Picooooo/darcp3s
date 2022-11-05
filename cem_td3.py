@@ -68,7 +68,7 @@ def get_args():
                         help='watch the play of pre-trained policy only')
     
     # ES parameters
-    parser.add_argument('--pop_size', default=10, type=int)
+    parser.add_argument('--pop_size', default=8, type=int)
     parser.add_argument('--elitism', dest="elitism",  action='store_true')
     parser.add_argument('--n_grad', default=5, type=int)
     parser.add_argument('--sigma_init', default=1e-3, type=float)
