@@ -104,6 +104,13 @@ class P3STD3Policy(DDPGPolicy):
         self.regularization_weight = regularization_weight
 
     def train(self, mode: bool = True) -> "P3STD3Policy":
+        self.training = mode
+        self.actor1.train(mode)
+        self.critic1.train(mode)
+        self.critic2.train(mode)
+        return self
+    
+    def train2(self, mode: bool = True) -> "P3STD3Policy":
         #print("!!!!!")
         # cái này có chạy nha m
         self.training = mode
@@ -118,7 +125,7 @@ class P3STD3Policy(DDPGPolicy):
         self.soft_update(self.critic2_old, self.critic2, self.tau)
         #update para của 2 actor 
         self.soft_update(self.actor1_old, self.actor1, self.tau)
-        self.soft_update(self.actor2_old, self.actor2, self.tau)
+        # self.soft_update(self.actor2_old, self.actor2, self.tau)
 
     def _target_q(self, buffer: ReplayBuffer, indices: np.ndarray) -> torch.Tensor:
         # cái này cũng có chạy
@@ -183,17 +190,17 @@ class P3STD3Policy(DDPGPolicy):
 
         # actor
         if self._cnt % self._freq == 0:
-            actor1_loss = (-self.critic1(batch.obs, self(batch, eps=0.0).act) + beta * KL).mean()
+            actor1_loss = (-self.critic1(batch.obs, self(batch,model="actor1", eps=0.0).act) + beta * KL).mean()
             self.actor1_optim.zero_grad()
             actor1_loss.backward()
             self._last1 = actor1_loss.item()
             self.actor1_optim.step()
             # update hàm loss của 2 actor
-            actor2_loss = (-self.critic2(batch.obs, self(batch, eps=0.0).act) + beta * KL).mean()
-            self.actor2_optim.zero_grad()
-            actor2_loss.backward()
-            self._last2 = actor2_loss.item()
-            self.actor2_optim.step()
+            # actor2_loss = (-self.critic2(batch.obs, self(batch,model="actor2", eps=0.0).act) + beta * KL).mean()
+            # self.actor2_optim.zero_grad()
+            # actor2_loss.backward()
+            # self._last2 = actor2_loss.item()
+            # self.actor2_optim.step()
             self.sync_weight()
         self._cnt += 1
         return {
