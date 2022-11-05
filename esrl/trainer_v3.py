@@ -163,6 +163,12 @@ def trainer_v3(
             #policy.actor_optim = torch.optim.Adam(policy.actor.parameters(), actor_lr)
             set_params(policy.actor1, params[pop_ind])
             policy.actor1_optim = torch.optim.Adam(policy.actor1.parameters(), actor_lr)
+            if pop_ind % 2 == 0:
+                set_params(policy.actor2, params[pop_ind + 1])
+                policy.actor2_optim = torch.optim.Adam(policy.actor2.parameters(), actor_lr)
+            else:
+                set_params(policy.actor2, params[pop_ind - 1])
+                policy.actor2_optim = torch.optim.Adam(policy.actor2.parameters(), actor_lr)
             policy.train()
             actor_step = 0
             actor_score = 0
@@ -223,47 +229,6 @@ def trainer_v3(
         test_result = test_episode(policy, test_collector, test_fn, epoch,
                                    episode_per_test, logger, env_step, reward_metric)
 
-        #update beta
-        # if update_beta_step+10000 < env_step:
-        #     old_params = params
-        #     new_params = rl_params
-        #     new_policy = deepcopy(policy)
-        #     old_policy = deepcopy(policy)
-        #     D_best = []
-        #     D_change = []
-        #     batch, indices = train_collector.buffer.sample(batch_size)
-        #     set_params(best_actor.actor, best_actor_params)
-        #     for pop_ind in range(pop_size//2):
-        #         if pop_ind != best_actor_index:
-        #             #print(best_actor_index)
-        #             set_params(new_policy.actor, new_params[pop_ind])
-        #             set_params(old_policy.actor, old_params[pop_ind])
-        #             batch = new_policy.process_fn(batch, train_collector.buffer, indices)
-        #             new_dist = new_policy(batch).act
-        #             batch = best_actor.process_fn(batch, train_collector.buffer, indices)
-        #             best_dist = best_actor(batch).act
-        #             batch = old_policy.process_fn(batch, train_collector.buffer, indices)
-        #             old_dist = old_policy(batch).act
-        #             std = torch.ones([1, action_shape[0]]).float().to(device)
-        #             best_KL = kl(new_dist, std, best_dist, std).mean()
-        #             old_KL = kl(new_dist, std, old_dist, std).mean()
-
-        #             D_best.append(best_KL)
-        #             D_change.append(old_KL)
-        #             #print(D_best)
-        #             #print(D_change)
-        #     print(torch.mean(torch.stack(D_best)))
-        #     print(torch.mean(torch.stack(D_change)))
-        #     print(max(0.5 * torch.mean(torch.stack(D_change)), 0.07) * 1.5)
-        #     print(max(0.5 * torch.mean(torch.stack(D_change)), 0.07) / 1.5)
-        #     if torch.mean(torch.stack(D_best)) > max(0.5 * torch.mean(torch.stack(D_change)), 0.07) * 1.5:
-        #         if beta < 1000:
-        #             beta = beta * 2
-        #     if torch.mean(torch.stack(D_best)) < max(0.5 * torch.mean(torch.stack(D_change)), 0.07) / 1.5:
-        #         if beta > 1/1000:
-        #             beta = beta / 2
-        #     update_beta_step = env_step
-        #     print(beta)
         
         rew, rew_std = test_result["rew"], test_result["rew_std"]
         df.to_pickle(os.path.join(log_path, 'log.pkl'))
