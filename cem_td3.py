@@ -24,7 +24,7 @@ from tianshou.env import SubprocVectorEnv
 from tianshou.utils.net.common import Net
 from tianshou.trainer import offpolicy_trainer
 from tianshou.utils.net.continuous import Actor, Critic
-from tianshou.data import Collector, ReplayBuffer, VectorReplayBuffer
+from esrl.data.collector import Collector, ReplayBuffer, VectorReplayBuffer
 
 
 def get_args():

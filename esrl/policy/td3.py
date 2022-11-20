@@ -154,7 +154,9 @@ class P3STD3Policy(DDPGPolicy):
         batch: Batch,
         state: Optional[Union[dict, Batch, np.ndarray]] = None,
         model: str = "actor1",
+        model2: str = "actor2",
         input: str = "obs",
+        flag: bool = False,
         **kwargs: Any,
     ) -> Batch:
         """Compute action over the given batch data.
@@ -169,8 +171,19 @@ class P3STD3Policy(DDPGPolicy):
         #t đang bí ko bk code khúc này sao khi mà có 2 actor
         model = getattr(self, model)
         obs = batch[input]
-        actions, hidden = model(obs, state=state, info=batch.info)
+        if flag == False:
+            actions, hidden = model(obs, state=state, info=batch.info)
+        else:
+            model2 = getattr(self, model2)
+            actions, hidden = model(obs, state=state, info=batch.info)
+            actions2, hidden2 = model2(obs, state=state, info=batch.info)
+            q1 = self.critic1(obs, actions)
+            q2 = self.critic2(obs, actions2)
+
+            if q2 > q1:
+                actions, hidden = actions2, hidden2
         return Batch(act=actions, state=hidden)
+    
 
     def learn(self,best_actor: Any,action_shape:Any, batch: Batch, beta, **kwargs: Any) -> Dict[str, float]:
         # critic 1&2
